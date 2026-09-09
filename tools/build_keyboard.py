@@ -1,18 +1,20 @@
-"""Generate a phone-keyboard background with one face per key.
-
-The layout matches the QWERTY / 두벌식 한글 grid (10 / 9 / 7 + space row),
-so the same image works for both the English and Korean keyboards.
+"""Generate a phone-keyboard background with one face per key, labeled
+with the actual QWERTY letter and 두벌식 한글 jamo printed on each key
+(like a real keyboard skin sticker).
 """
 
 import os
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PHOTOS = os.path.join(ROOT, "photos")
 OUT_DIR = os.path.join(ROOT, "keyboard")
+FONT_PATH = "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"
 
 TEAL = (57, 197, 187)
 BG = (11, 13, 17)
+WHITE = (255, 255, 255)
+MUTED = (205, 216, 224)
 
 ORDER = [
     "01_miku.png", "02_teto.png", "03_rin.png", "07_len.png", "04_luka.png",
@@ -20,13 +22,30 @@ ORDER = [
     "10_blondepink.png", "09_bluebolt.png", "08_laser.png", "11_meme.jpg",
 ]
 
+# (column start, span, korean jamo, english letter) for the two 10/9-wide
+# letter rows, then the mixed third/fourth rows below.
+ROW1 = [("ㅂ", "Q"), ("ㅈ", "W"), ("ㄷ", "E"), ("ㄱ", "R"), ("ㅅ", "T"),
+        ("ㅛ", "Y"), ("ㅕ", "U"), ("ㅑ", "I"), ("ㅐ", "O"), ("ㅔ", "P")]
+ROW2 = [("ㅁ", "A"), ("ㄴ", "S"), ("ㅇ", "D"), ("ㄹ", "F"), ("ㅎ", "G"),
+        ("ㅗ", "H"), ("ㅓ", "J"), ("ㅏ", "K"), ("ㅣ", "L")]
+ROW3_MID = [("ㅋ", "Z"), ("ㅌ", "X"), ("ㅊ", "C"), ("ㅍ", "V"), ("ㅠ", "B"),
+            ("ㅜ", "N"), ("ㅡ", "M")]
+
 _cache = {}
+_font_cache = {}
 
 
 def photo(name):
     if name not in _cache:
         _cache[name] = Image.open(os.path.join(PHOTOS, name)).convert("RGB")
     return _cache[name]
+
+
+def font(size):
+    size = max(1, int(size))
+    if size not in _font_cache:
+        _font_cache[size] = ImageFont.truetype(FONT_PATH, size)
+    return _font_cache[size]
 
 
 def face(name, w, h):
@@ -51,7 +70,7 @@ def face(name, w, h):
     return crop.resize((w, h), Image.LANCZOS)
 
 
-def key(names, w, h, radius, dim, border=True):
+def key_image(names, w, h, radius, dim, border=True):
     """One key tile: dimmed face(s), rounded corners, teal hairline.
 
     A wide key (space bar) is filled with a strip of faces instead of one
@@ -86,7 +105,85 @@ def key(names, w, h, radius, dim, border=True):
     return tile.resize((w, h), Image.LANCZOS)
 
 
-def build(width=1440, height=1040, dim=0.42, path="keyboard_vocaloid.png"):
+def label_letter_key(tile, kr, en):
+    """Stamp small English top-left + big Korean jamo bottom, keycap-sticker style."""
+    SSF = 3
+    w, h = tile.size[0] * SSF, tile.size[1] * SSF
+    big = tile.resize((w, h), Image.LANCZOS)
+    d = ImageDraw.Draw(big)
+
+    # bottom scrim so the jamo reads over any face brightness
+    scrim = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    ds = ImageDraw.Draw(scrim)
+    ds.rectangle([0, h * 0.56, w, h], fill=(8, 10, 14, 150))
+    big = Image.alpha_composite(big, scrim)
+    d = ImageDraw.Draw(big)
+
+    en_size = h * 0.20
+    d.text((w * 0.11, h * 0.07), en, font=font(en_size), fill=MUTED + (235,))
+
+    kr_size = h * 0.40
+    kf = font(kr_size)
+    bbox = d.textbbox((0, 0), kr, font=kf)
+    tw = bbox[2] - bbox[0]
+    d.text((w / 2 - tw / 2 - bbox[0], h * 0.60), kr, font=kf, fill=WHITE + (255,))
+
+    return big.resize(tile.size, Image.LANCZOS)
+
+
+def _dim_bottom(tile, ssf, frac=0.30, alpha=160):
+    w, h = tile.size[0] * ssf, tile.size[1] * ssf
+    big = tile.resize((w, h), Image.LANCZOS)
+    scrim = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    ImageDraw.Draw(scrim).rectangle([0, h * (1 - frac), w, h], fill=(8, 10, 14, alpha))
+    return Image.alpha_composite(big, scrim), w, h
+
+
+def label_special_key(tile, text, size_frac=0.30):
+    SSF = 3
+    big, w, h = _dim_bottom(tile, SSF)
+    d = ImageDraw.Draw(big)
+
+    fs = h * size_frac
+    kf = font(fs)
+    bbox = d.textbbox((0, 0), text, font=kf)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    d.text((w / 2 - tw / 2 - bbox[0], h * 0.66 - th / 2 - bbox[1]), text, font=kf, fill=WHITE + (255,))
+
+    return big.resize(tile.size, Image.LANCZOS)
+
+
+def label_icon_key(tile, icon):
+    """Draw a keyboard icon (shift / backspace / enter) as vector shapes,
+    since these glyphs aren't reliably in every font."""
+    SSF = 3
+    big, w, h = _dim_bottom(tile, SSF)
+    d = ImageDraw.Draw(big)
+    cx, cy = w / 2, h * 0.70
+    s = min(w, h) * 0.30
+    lw = max(2, int(s * 0.16))
+    c = WHITE + (255,)
+
+    if icon == "shift":
+        d.polygon([(cx - s * 0.55, cy + s * 0.05), (cx, cy - s * 0.65), (cx + s * 0.55, cy + s * 0.05)],
+                  outline=c, width=lw)
+        d.rectangle([cx - s * 0.28, cy + s * 0.05, cx + s * 0.28, cy + s * 0.55], outline=c, width=lw)
+    elif icon == "backspace":
+        pts = [(cx - s * 0.75, cy), (cx - s * 0.30, cy - s * 0.45), (cx + s * 0.75, cy - s * 0.45),
+               (cx + s * 0.75, cy + s * 0.45), (cx - s * 0.30, cy + s * 0.45)]
+        d.polygon(pts, outline=c, width=lw)
+        d.line([(cx - s * 0.02, cy - s * 0.20), (cx + s * 0.40, cy + s * 0.20)], fill=c, width=lw)
+        d.line([(cx - s * 0.02, cy + s * 0.20), (cx + s * 0.40, cy - s * 0.20)], fill=c, width=lw)
+    elif icon == "enter":
+        d.line([(cx + s * 0.55, cy - s * 0.55), (cx + s * 0.55, cy + s * 0.05),
+                (cx - s * 0.55, cy + s * 0.05)], fill=c, width=lw, joint="curve")
+        d.polygon([(cx - s * 0.20, cy - s * 0.30), (cx - s * 0.20, cy + s * 0.40),
+                   (cx - s * 0.70, cy + s * 0.05)], fill=c)
+
+    return big.resize(tile.size, Image.LANCZOS)
+
+
+def build(width=1440, height=1300, dim=0.42, path="keyboard_vocaloid.png"):
     canvas = Image.new("RGBA", (width, height), BG + (255,))
 
     # subtle backdrop so gaps between keys are not flat black
@@ -103,7 +200,7 @@ def build(width=1440, height=1040, dim=0.42, path="keyboard_vocaloid.png"):
 
     idx = 0
 
-    def place(col_start, span, row):
+    def place(col_start, span, row, kr=None, en=None, label=None, icon=None):
         nonlocal idx
         x0 = col_start * unit + pad_x
         x1 = (col_start + span) * unit - pad_x
@@ -115,29 +212,35 @@ def build(width=1440, height=1040, dim=0.42, path="keyboard_vocaloid.png"):
         slots = max(1, round(w / h))
         names = [ORDER[(idx + i) % len(ORDER)] for i in range(slots)]
         idx += slots
-        tile = key(names, w, h, radius, dim)
+        tile = key_image(names, w, h, radius, dim)
+        if kr and en:
+            tile = label_letter_key(tile, kr, en)
+        elif icon:
+            tile = label_icon_key(tile, icon)
+        elif label:
+            tile = label_special_key(tile, label)
         canvas.paste(tile, (int(x0), int(y0)), tile)
 
     # row 1 : ㅂㅈㄷㄱㅅㅛㅕㅑㅐㅔ  /  Q W E R T Y U I O P
-    for c in range(10):
-        place(c, 1, 0)
+    for c, (kr, en) in enumerate(ROW1):
+        place(c, 1, 0, kr, en)
 
     # row 2 : ㅁㄴㅇㄹㅎㅗㅓㅏㅣ  /  A S D F G H J K L
-    for c in range(9):
-        place(c + 0.5, 1, 1)
+    for c, (kr, en) in enumerate(ROW2):
+        place(c + 0.5, 1, 1, kr, en)
 
     # row 3 : shift + ㅋㅌㅊㅍㅠㅜㅡ + backspace
-    place(0, 1.5, 2)
-    for c in range(7):
-        place(1.5 + c, 1, 2)
-    place(8.5, 1.5, 2)
+    place(0, 1.5, 2, icon="shift")
+    for c, (kr, en) in enumerate(ROW3_MID):
+        place(1.5 + c, 1, 2, kr, en)
+    place(8.5, 1.5, 2, icon="backspace")
 
     # row 4 : 123 / , / space / . / enter
-    place(0, 1.5, 3)
-    place(1.5, 1, 3)
-    place(2.5, 5, 3)
-    place(7.5, 1, 3)
-    place(8.5, 1.5, 3)
+    place(0, 1.5, 3, label="123")
+    place(1.5, 1, 3, label=",")
+    place(2.5, 5, 3, label="space")
+    place(7.5, 1, 3, label=".")
+    place(8.5, 1.5, 3, icon="enter")
 
     os.makedirs(OUT_DIR, exist_ok=True)
     out = os.path.join(OUT_DIR, path)
