@@ -68,6 +68,12 @@
 
 **[VocaloidCosplay.apk 받기](https://github.com/DevToolXD/comi2/raw/refs/heads/claude/kakaotalk-theme-creation-bho737/android/VocaloidCosplay.apk)** (3.9MB)
 
+![android preview](docs/assets/android_chat_preview.png)
+
+말풍선 위에 이름표가 박혀 있습니다 — 내 말풍선엔 **코미**(핑크), 상대 말풍선엔 **좆현우**(민트).
+9-patch에서 안 늘어나는 고정 구간에 넣어서, 메시지가 길든 짧든 글자가 안 뭉개집니다.
+연속 메시지(두 번째 줄부터)는 카톡 규칙대로 이름표 없이 나옵니다.
+
 ### 적용 방법
 
 1. 위 apk를 갤럭시에서 다운로드

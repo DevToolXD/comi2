@@ -21,7 +21,7 @@ import struct
 import sys
 import zipfile
 
-from PIL import Image, ImageDraw, ImageFilter, ImageChops
+from PIL import Image, ImageDraw, ImageFilter, ImageChops, ImageFont
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PHOTOS = os.path.join(ROOT, "photos")
@@ -349,94 +349,195 @@ def _encode_idat(rgba_bytes, w, h, has_alpha):
     return _zlib.compress(bytes(raw), 9)
 
 
-def recolor_ninepatch(png_bytes, remap, min_fraction=0.5):
-    """Replace only the dominant opaque color(s) (>= min_fraction of all
-    opaque pixels) using `remap` (dict old_rgb -> new_rgb); every other
-    pixel (accents, anti-aliased edges) is left untouched. All chunks
-    except IDAT are copied verbatim, so npOl/npTc (9-patch stretch
-    metadata) survive exactly as aapt2 compiled them.
+NP_NO_COLOR = 0x00000001
+NP_TRANSPARENT = 0x00000000
+FONT_PATH = "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"
+
+
+def _parse_nptc(payload):
+    """npTc is big-endian. Returns (header_dict, xdivs, ydivs, colors)."""
+    n_x, n_y, n_c = payload[1], payload[2], payload[3]
+    base = 32
+    xd = list(struct.unpack(">%di" % n_x, payload[base:base + 4 * n_x]))
+    base += 4 * n_x
+    yd = list(struct.unpack(">%di" % n_y, payload[base:base + 4 * n_y]))
+    base += 4 * n_y
+    colors = list(struct.unpack(">%dI" % n_c, payload[base:base + 4 * n_c]))
+    return payload[:32], xd, yd, colors
+
+
+def _rebuild_nptc(payload, colors):
+    """Replace only the trailing colors array, keeping everything else."""
+    head, xd, yd, old = _parse_nptc(payload)
+    assert len(colors) == len(old), (len(colors), len(old))
+    body = struct.pack(">%di" % len(xd), *xd) + struct.pack(">%di" % len(yd), *yd)
+    return head + body + struct.pack(">%dI" % len(colors), *colors)
+
+
+def _region_colors(im, xdivs, ydivs):
+    """Recompute the 9-patch per-region color hints from actual pixels.
+
+    Android fills a region with this color instead of sampling the bitmap
+    when it is a single solid colour, so a stale hint would paint the old
+    theme's colour straight over our artwork.
+    """
+    w, h = im.size
+    px = im.convert("RGBA").load()
+    xs = [0] + list(xdivs) + [w]
+    ys = [0] + list(ydivs) + [h]
+    out = []
+    for r in range(len(ys) - 1):
+        for c in range(len(xs) - 1):
+            first = None
+            uniform = True
+            all_clear = True
+            for y in range(ys[r], ys[r + 1]):
+                for x in range(xs[c], xs[c + 1]):
+                    p = px[x, y]
+                    if p[3] != 0:
+                        all_clear = False
+                    if first is None:
+                        first = p
+                    elif p != first:
+                        uniform = False
+                        break
+                if not uniform:
+                    break
+            if all_clear:
+                out.append(NP_TRANSPARENT)
+            elif uniform and first is not None:
+                r_, g_, b_, a_ = first
+                out.append((a_ << 24) | (r_ << 16) | (g_ << 8) | b_)
+            else:
+                out.append(NP_NO_COLOR)
+    return out
+
+
+def _draw_name_tag(im, text, fill, text_color, anchor, bubble_top):
+    """Draw a rounded name label in the fixed, non-stretching strip above
+    the bubble (the area the template already reserved for decoration).
+
+    anchor: "left" or "right" -- must be the side that does NOT contain the
+    stretch column, so the label stays glued to that edge when the bubble
+    grows. Characters are drawn one at a time so spacing stays exact.
+    """
+    W, _ = im.size
+    SS = 4
+    gap = 8
+    tag_h = max(30, bubble_top - gap)
+    font_px = int(tag_h * 0.60)
+    font = ImageFont.truetype(FONT_PATH, font_px * SS)
+
+    tracking = int(font_px * 0.06) * SS
+    widths = [font.getbbox(ch)[2] - font.getbbox(ch)[0] for ch in text]
+    text_w = sum(widths) + tracking * (len(text) - 1)
+    pad_x = int(font_px * 0.55)
+    tag_w = text_w // SS + pad_x * 2
+
+    layer = Image.new("RGBA", (tag_w * SS, tag_h * SS), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    d.rounded_rectangle([0, 0, tag_w * SS - 1, tag_h * SS - 1],
+                        radius=tag_h * SS // 2, fill=fill + (255,))
+
+    # little tail, pointing down toward the bubble on the anchored side
+    tw = int(tag_h * 0.34) * SS
+    tx = int(tag_w * 0.22) * SS if anchor == "left" else int(tag_w * 0.78) * SS - tw
+    d.polygon([(tx, tag_h * SS - 2), (tx + tw, tag_h * SS - 2),
+               (tx + tw // 2, tag_h * SS + int(gap * 0.8) * SS)], fill=fill + (255,))
+
+    x = pad_x * SS
+    ascent, descent = font.getmetrics()
+    baseline = (tag_h * SS - (ascent + descent)) // 2 + ascent
+    for ch, cw in zip(text, widths):
+        bbox = font.getbbox(ch)
+        d.text((x - bbox[0], baseline), ch, font=font, fill=text_color + (255,),
+               anchor="ls")
+        x += cw + tracking
+
+    layer = layer.resize((tag_w, tag_h + gap), Image.LANCZOS)
+    px = 6 if anchor == "left" else W - tag_w - 6
+    im.alpha_composite(layer, (max(0, px), 0))
+    return im
+
+
+def rebuild_ninepatch(png_bytes, mode, spec, name=None, name_fill=None,
+                      name_text_color=(7, 39, 43), anchor="left"):
+    """Recolor a compiled 9-patch and optionally stamp a name label on it.
+
+    Every chunk except IDAT and npTc is copied verbatim, so the stretch
+    divisions and padding aapt2 computed survive untouched. npTc's trailing
+    per-region colour hints ARE recomputed from the final pixels: Android
+    fills a region with its hint colour instead of sampling the bitmap when
+    the region is a single solid colour, so leaving the template's hints in
+    place would paint the original theme's colours over our artwork.
     """
     chunks = _png_chunks(png_bytes)
     ihdr = next(p for t, p, _ in chunks if t == b"IHDR")
     w, h, bitdepth, colortype = struct.unpack(">IIBB", ihdr[:10])
     has_alpha = colortype == 6
 
-    im = Image.open(io.BytesIO(png_bytes)).convert("RGBA" if has_alpha else "RGB")
+    im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
     px = im.load()
 
-    counts = {}
-    for y in range(h):
-        for x in range(w):
-            p = px[x, y]
-            if has_alpha and p[3] == 0:
-                continue
-            key = p[:3]
-            counts[key] = counts.get(key, 0) + 1
-    total = sum(counts.values()) or 1
-    dominant = {c for c, n in counts.items() if n / total >= min_fraction}
+    if mode == "dominant":
+        counts = {}
+        for y in range(h):
+            for x in range(w):
+                p = px[x, y]
+                if p[3] == 0:
+                    continue
+                counts[p[:3]] = counts.get(p[:3], 0) + 1
+        total = sum(counts.values()) or 1
+        dominant = {c for c, n in counts.items() if n / total >= 0.5}
+        swap = {old: spec[old] for old in dominant if old in spec}
+        if not swap:
+            raise ValueError(f"dominant colors {dominant} not in remap {spec}")
+        new_fill = next(iter(swap.values()))
+        for y in range(h):
+            for x in range(w):
+                p = px[x, y]
+                if p[:3] in swap:
+                    px[x, y] = swap[p[:3]] + (p[3],)
+    else:
+        new_fill = spec
+        for y in range(h):
+            for x in range(w):
+                p = px[x, y]
+                if p[3] > 0:
+                    px[x, y] = new_fill + (p[3],)
 
-    swap = {}
-    for old in dominant:
-        for src, dst in remap.items():
-            if old == src:
-                swap[old] = dst
-    if not swap:
-        raise ValueError(f"none of the dominant colors {dominant} matched remap {remap}")
+    if name:
+        # the template reserves a decorative strip above the bubble; find
+        # where the bubble itself starts, wipe the old sticker, put the name
+        # label there instead
+        bubble_top = h
+        for y in range(h):
+            if any(px[x, y][:3] == new_fill and px[x, y][3] > 0 for x in range(w)):
+                bubble_top = y
+                break
+        clear_to = max(0, bubble_top - 4)
+        for y in range(clear_to):
+            for x in range(w):
+                px[x, y] = (0, 0, 0, 0)
+        _draw_name_tag(im, name, name_fill, name_text_color, anchor, bubble_top)
 
-    for y in range(h):
-        for x in range(w):
-            p = px[x, y]
-            key = p[:3]
-            if key in swap:
-                if has_alpha:
-                    px[x, y] = swap[key] + (p[3],)
-                else:
-                    px[x, y] = swap[key]
+    out_im = im if has_alpha else im.convert("RGB")
+    new_idat = _encode_idat(out_im.tobytes(), w, h, has_alpha)
 
-    raw = im.tobytes()
-    new_idat_data = _encode_idat(raw, w, h, has_alpha)
+    nptc = next(p for t, p, _ in chunks if t == b"npTc")
+    _, xd, yd, _old_colors = _parse_nptc(nptc)
+    new_nptc = _rebuild_nptc(nptc, _region_colors(im, xd, yd))
 
     out = bytearray(b"\x89PNG\r\n\x1a\n")
     inserted = False
     for ctype, payload, _ in chunks:
         if ctype == b"IDAT":
             if not inserted:
-                out += _make_chunk(b"IDAT", new_idat_data)
+                out += _make_chunk(b"IDAT", new_idat)
                 inserted = True
             continue
-        out += _make_chunk(ctype, payload)
-    return bytes(out)
-
-
-def recolor_solid(png_bytes, new_rgb):
-    """For a fully solid-color 9-patch (no accents at all): flood every
-    opaque pixel to new_rgb, same chunk-preservation approach."""
-    chunks = _png_chunks(png_bytes)
-    ihdr = next(p for t, p, _ in chunks if t == b"IHDR")
-    w, h, bitdepth, colortype = struct.unpack(">IIBB", ihdr[:10])
-    has_alpha = colortype == 6
-
-    im = Image.open(io.BytesIO(png_bytes)).convert("RGBA" if has_alpha else "RGB")
-    px = im.load()
-    for y in range(h):
-        for x in range(w):
-            p = px[x, y]
-            if has_alpha:
-                if p[3] > 0:
-                    px[x, y] = new_rgb + (p[3],)
-            else:
-                px[x, y] = new_rgb
-
-    raw = im.tobytes()
-    new_idat_data = _encode_idat(raw, w, h, has_alpha)
-
-    out = bytearray(b"\x89PNG\r\n\x1a\n")
-    inserted = False
-    for ctype, payload, _ in chunks:
-        if ctype == b"IDAT":
-            if not inserted:
-                out += _make_chunk(b"IDAT", new_idat_data)
-                inserted = True
+        if ctype == b"npTc":
+            out += _make_chunk(b"npTc", new_nptc)
             continue
         out += _make_chunk(ctype, payload)
     return bytes(out)
@@ -607,12 +708,27 @@ def build_all_images(original_sizes):
     return out
 
 
-NINEPATCH_RECOLORS = {
-    "theme_chatroom_bubble_me_01_image.9.png": ("dominant", {(34, 51, 230): TEAL}),
-    "theme_chatroom_bubble_me_02_image.9.png": ("solid", TEAL),
-    "theme_chatroom_bubble_you_01_image.9.png": ("dominant", {(242, 244, 244): (42, 49, 61)}),
-    "theme_chatroom_bubble_you_02_image.9.png": ("solid", (42, 49, 61)),
-    "theme_maintab_cell_image.9.png": ("solid", PANEL2),
+YOU_BUBBLE = (42, 49, 61)
+
+# Name labels ride in the fixed strip above each first-of-group bubble, on
+# the side away from that bubble's stretch column, so they never smear:
+# "me" stretches at x=60..63 (label goes right), "you" at x=258..261 (left).
+MY_NAME = "코미"
+THEIR_NAME = "좆현우"
+
+NINEPATCH_JOBS = {
+    "theme_chatroom_bubble_me_01_image.9.png": dict(
+        mode="dominant", spec={(34, 51, 230): TEAL},
+        name=MY_NAME, name_fill=PINK, anchor="right"),
+    "theme_chatroom_bubble_me_02_image.9.png": dict(
+        mode="solid", spec=TEAL),
+    "theme_chatroom_bubble_you_01_image.9.png": dict(
+        mode="dominant", spec={(242, 244, 244): YOU_BUBBLE},
+        name=THEIR_NAME, name_fill=TEAL, anchor="left"),
+    "theme_chatroom_bubble_you_02_image.9.png": dict(
+        mode="solid", spec=YOU_BUBBLE),
+    "theme_maintab_cell_image.9.png": dict(
+        mode="solid", spec=PANEL2),
 }
 
 
@@ -620,13 +736,10 @@ def build_ninepatch_images(original_bytes_by_path):
     out = {}
     for path, data in original_bytes_by_path.items():
         base = os.path.basename(path)
-        if base not in NINEPATCH_RECOLORS:
+        job = NINEPATCH_JOBS.get(base)
+        if job is None:
             continue
-        mode, spec = NINEPATCH_RECOLORS[base]
-        if mode == "dominant":
-            out[path] = recolor_ninepatch(data, spec)
-        else:
-            out[path] = recolor_solid(data, spec)
+        out[path] = rebuild_ninepatch(data, **job)
     return out
 
 
@@ -647,7 +760,7 @@ def main():
             w, h, *_ = struct.unpack(">IIBB", data[16:26])
             sizes[name] = (w, h)
 
-    ninepatch_names = {n for n in sizes if os.path.basename(n) in NINEPATCH_RECOLORS}
+    ninepatch_names = {n for n in sizes if os.path.basename(n) in NINEPATCH_JOBS}
     plain_sizes = {n: s for n, s in sizes.items() if n not in ninepatch_names}
 
     print("== generating plain images ==")
