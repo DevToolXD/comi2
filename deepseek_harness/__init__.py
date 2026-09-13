@@ -19,6 +19,8 @@ from .context import Conversation
 from .memory import WorkingMemory
 from .refusal import RefusalHandler, RefusalKind, classify
 from .patch import apply_edits, parse_edits
+from . import repomap, selection
+from .selection import Candidate, SelectionResult
 from .tools import ToolRegistry, default_registry, exec_command
 from .telemetry import Telemetry, Usage
 from .agents import Agent, AgentResult, CodingAgent, ReasoningAgent
@@ -34,7 +36,8 @@ __all__ = [
     "Harness", "RunOutcome", "Config", "Budget", "RetryPolicy", "ModelSpec",
     "FLASH", "PRO", "is_peak", "DeepSeekClient", "Completion", "Thinking",
     "Conversation", "WorkingMemory", "RefusalHandler", "RefusalKind", "classify",
-    "apply_edits", "parse_edits", "ToolRegistry", "default_registry", "exec_command",
+    "apply_edits", "parse_edits", "repomap", "selection",
+    "Candidate", "SelectionResult", "ToolRegistry", "default_registry", "exec_command",
     "Telemetry", "Usage", "Agent", "AgentResult", "CodingAgent", "ReasoningAgent",
     "HarnessError", "TransportError", "APIError", "ReasoningRoundtripError",
     "BudgetExceeded", "RefusalUnresolved", "PatchError", "__version__",

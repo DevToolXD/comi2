@@ -68,7 +68,7 @@ class Harness:
 
     # -- public ----------------------------------------------------------
     def run(self, task: str, *, lane: str | None = None, effort: str = "high",
-            samples: int = 1, review: bool = True) -> RunOutcome:
+            samples: int = 1, candidates: int = 1, review: bool = True) -> RunOutcome:
         lane = lane or self.route(task)
         self._check_budget()
 
@@ -78,7 +78,8 @@ class Harness:
                 registry=self.registry, verify_command=self.verify_command,
                 purpose_context=self.purpose_context,
             )
-            result: AgentResult = agent.run(task, effort=effort, review=review)
+            result: AgentResult = agent.run(task, effort=effort,
+                                            candidates=candidates, review=review)
         elif lane == "reasoning":
             agent = ReasoningAgent(self.client, self.config,
                                    purpose_context=self.purpose_context)

@@ -42,6 +42,8 @@ transport.py   HTTP + retry/backoff (httpx if present, else stdlib)
 messages.py    message types, reasoning round-trip, safe degradation
 client.py      param negotiation, model alias probing, telemetry
 context.py     conversation assembly + compaction
+repomap.py     symbol-level repo index, ranked by task overlap + centrality
+selection.py   execution-guided candidate selection
 memory.py      durable working memory (facts / decisions / dead ends)
 refusal.py     refusal detection + bounded re-request
 patch.py       SEARCH/REPLACE edit engine
@@ -92,6 +94,46 @@ is transcribing exact SEARCH text. A failed patch is *repaired* with the
 specific reason ("matched 3 places", plus the closest real lines), not
 regenerated. Every failure is written to dead-end memory.
 
+### Execution-guided candidate selection
+
+The strongest test-time technique a coding agent has is not a better prompt and
+not more thinking: generate several independent patches and let the **test
+suite** pick the winner. A model reviewing its own patch grades its intent; a
+test run grades the code, and has none of the framing that made the bug
+invisible in the first place.
+
+```bash
+python -m deepseek_harness --lane coding --verify "pytest -q" --candidates 5 "<task>"
+```
+
+Each candidate is generated against a different framing (smallest change / root
+cause / reuse existing / edge cases first / critique your first instinct) and
+the models alternate. That is deliberate: thinking mode ignores `temperature`,
+so identical prompts produce near-identical patches and best-of-N collapses
+into paying N times for one answer.
+
+Candidates are applied and tested in isolated copies of the workspace; nothing
+is written back until one is adopted. Rejected patches that applied but failed
+go into dead-end memory.
+
+**The ceiling is the test, not the technique.** Selection rejects only what the
+verification command catches. Given `assert add(2, 2) == 4`, a patch returning
+`a * b` passes. Point `--verify` at the most discriminating test set you have,
+not the fastest one.
+
+### Repo map
+
+`repomap.py` replaces the flat file listing with a symbol-level index: every
+definition with its signature and line number, ranked by two signals -- how many
+identifiers from the task appear in a file, and how many *other* files use the
+symbols it defines. The second is what surfaces the module a rename will touch
+in thirty places when the task never names it.
+
+Python is parsed with `ast`; JS/TS/Go/Rust/Java/Ruby/PHP fall back to signature
+regexes; anything unparseable degrades to the plain path listing.
+
+### Edit format
+
 Edits use anchored SEARCH/REPLACE (`patch.py`) because a mismatch is
 *detectable*: a block matching twice is rejected rather than applied to the
 first hit, and a block matching nowhere comes back with the closest lines that
@@ -111,12 +153,14 @@ gap ("I don't have access to that file"), a **spurious** refusal (ordinary
 technical work misread as harmful), and a **principled** one.
 
 Retries work by supplying information — restating the operator's real context,
-making the ask concrete, decomposing it, switching model. They deliberately do
-**not** apply escalating pressure, inject a persona, or forge an assistant
-prefix. Those do not fix a correct refusal, they only launder it, and on the
-far more common spurious case they measurably degrade the output you get. When
-the bound is spent the refusal is handed back with the full attempt trail
-rather than looped on.
+making the ask concrete, decomposing it, switching model. They work because the
+common case is a misread, and a misread is fixed by information. When the bound
+is spent the refusal is handed back with the full attempt trail rather than
+looped on.
+
+The harness filters nothing. There is no blocklist, no moderation call, and no
+inspection of what you ask for; classification only picks which retry strategy
+to lead with.
 
 `purpose_context` is operator-supplied text (engagement scope, ticket,
 authorisation) attached on retry. You assert it; the harness does not invent it.
@@ -166,12 +210,14 @@ calls=11  in=284,102 (cache 71%)  out=18,340  think=42,110  $0.2214  96.3s
 ## Tests
 
 ```bash
-python -m pytest tests/ -q     # 69 tests, no network, no API key
+python -m pytest tests/ -q     # 81 tests, no network, no API key
 ```
 
 Unit coverage for the round-trip rule, cache ordering, compaction, the patch
-engine, refusal classification, pricing and budgets; end-to-end wiring for both
-agents and the tool loop against a mocked transport.
+engine, candidate selection, the repo map, refusal classification, pricing and
+budgets; end-to-end wiring for both agents and the tool loop against a mocked
+transport. Candidate selection and the repo map are exercised for real -- real
+files, real subprocess test runs -- not against mocks.
 
 ## Known gaps
 

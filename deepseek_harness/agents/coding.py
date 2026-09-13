@@ -20,8 +20,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .. import messages as M
 from ..client import DeepSeekClient, Thinking
 from ..config import Config
+from .. import repomap, selection
 from ..patch import EDIT_FORMAT_SPEC, PatchReport, apply_edits, parse_edits
 from ..tools import CommandResult, ToolRegistry, default_registry, exec_command
 from .base import Agent, AgentResult, parse_json
@@ -44,7 +46,7 @@ EXPLORE = """\
 Task:
 {task}
 
-Repository layout:
+Repository map (definitions, ranked by relevance):
 {tree}
 
 Before planning, identify what you must read. List up to {k} files, most \
@@ -96,6 +98,18 @@ fix the root cause. Do not weaken, skip or delete a test to make it pass.
 
 {dead_ends}"""
 
+CANDIDATE_FRAMINGS = [
+    "Prefer the smallest change that fixes this. Touch as few lines as possible.",
+    "Fix the root cause rather than the symptom, even if that means changing a "
+    "function signature or moving logic.",
+    "Before writing anything, check whether the codebase already has a helper, "
+    "pattern or abstraction for this and reuse it instead of adding new code.",
+    "Consider the edge cases first -- empty, zero, negative, duplicate, unicode, "
+    "concurrent -- and write the fix so those are handled, then the main path.",
+    "Assume your first instinct is wrong. Name the obvious fix, say why it is "
+    "insufficient, then implement the one that survives that critique.",
+]
+
 REVIEW = """\
 Review the diff you just produced, as a reviewer who wants to reject it.
 
@@ -133,12 +147,14 @@ class CodingAgent(Agent):
         root: str | Path = ".",
         registry: ToolRegistry | None = None,
         verify_command: str | None = None,
+        max_workspace_bytes: int = 256 * 1024 * 1024,
         **kw,
     ):
         super().__init__(client, config, **kw)
         self.root = Path(root).resolve()
         self.registry = registry or default_registry(self.root)
         self.verify_command = verify_command
+        self.max_workspace_bytes = max_workspace_bytes
         self.planner = self.config.planner_model
         self.worker = self.config.worker_model
 
@@ -148,6 +164,7 @@ class CodingAgent(Agent):
         task: str,
         *,
         effort: str = "high",
+        candidates: int = 1,
         max_patch_repairs: int = 3,
         max_test_repairs: int = 4,
         review: bool = True,
@@ -169,7 +186,11 @@ class CodingAgent(Agent):
         steps.append({"step": "plan", "output": plan.text})
 
         # 3. Implement + apply ------------------------------------------
-        report = self._implement(think, max_patch_repairs)
+        if candidates > 1 and self.verify_command:
+            report, sel = self._implement_by_selection(think, candidates, effort)
+            steps.append({"step": "candidates", "output": sel})
+        else:
+            report = self._implement(think, max_patch_repairs)
         steps.append({"step": "implement", "output": report.render()})
         if not report.applied:
             return CodingResult(
@@ -220,7 +241,9 @@ class CodingAgent(Agent):
 
     # -- stages ----------------------------------------------------------
     def _gather_sources(self, task: str, think: Thinking, k: int = 8) -> dict[str, str]:
-        tree = self.registry.tools["list_files"].fn(".", 400)
+        tree = repomap.render_for(self.root, task, max_chars=24_000)
+        if not tree:  # unparseable or unsupported languages -- fall back to paths
+            tree = self.registry.tools["list_files"].fn(".", 400)
         raw = self.scratch(
             EXPLORE.format(task=task, tree=tree[:30_000], k=k),
             model=self.planner, thinking=think,
@@ -269,6 +292,55 @@ class CodingAgent(Agent):
             report.failed = retry.failed
             report.files_changed = sorted(set(report.files_changed) | set(retry.files_changed))
         return report
+
+    def _implement_by_selection(self, think: Thinking, n: int, effort: str):
+        """Generate ``n`` patches independently and let the test suite choose.
+
+        Diversity is manufactured deliberately: thinking mode ignores
+        ``temperature``, so identical prompts yield near-identical patches and
+        best-of-N collapses into paying N times for one answer. Each candidate
+        gets a different framing and the models alternate.
+        """
+        base = self.convo.render(extra=IMPLEMENT.format(fmt=EDIT_FORMAT_SPEC))
+        models = [self.worker, self.planner]
+
+        def generate(i: int) -> str:
+            framing = CANDIDATE_FRAMINGS[i % len(CANDIDATE_FRAMINGS)]
+            history = list(base) + [M.user(f"Approach for this attempt: {framing}")]
+            return self.client.complete(
+                history,
+                model=models[i % len(models)],
+                thinking=Thinking(enabled=True, effort=effort),
+                label=f"code:candidate:{i}",
+            ).text
+
+        result = selection.select(
+            self.root, generate, self.verify_command, n=n,
+            max_workspace_bytes=self.max_workspace_bytes,
+        )
+        try:
+            if result.winner is None:
+                for c in result.candidates:
+                    self.memory.add_dead_end(f"candidate {c.index}: {c.error or 'no edits'}")
+                return PatchReport(), result.render()
+
+            selection.adopt(result.winner, self.root)
+            for c in result.candidates:
+                if c is not result.winner and c.applied and not c.passed:
+                    self.memory.add_dead_end(
+                        f"rejected patch: {c.summary()}"
+                    )
+            if result.any_passed:
+                self.memory.add_fact(
+                    f"candidate {result.winner.index} passed `{self.verify_command}` "
+                    f"while {len(result.candidates) - 1} alternative(s) did not"
+                )
+            report = result.winner.report or PatchReport()
+            for path in report.files_changed:
+                self.memory.note_artifact(path, "modified by this run")
+            return report, result.render()
+        finally:
+            selection.cleanup(result)
 
     def _apply_response(self, text: str) -> PatchReport:
         edits = parse_edits(text)

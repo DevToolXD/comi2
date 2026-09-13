@@ -556,3 +556,196 @@ def test_continuation_replays_the_partial_turn_with_its_reasoning():
     second = client.transport.payloads[1]["messages"]
     assistant_turns = [m for m in second if m["role"] == "assistant"]
     assert assistant_turns[0]["reasoning_content"] == "my cot"
+
+
+# --------------------------------------------------------------------------
+# Execution-guided candidate selection
+# --------------------------------------------------------------------------
+
+def _block(path, search, replace):
+    return f"{path}\n<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE"
+
+
+def test_selection_picks_the_candidate_that_passes_the_tests(tmp_path):
+    """The whole point: the test suite chooses, not the model's self-assessment."""
+    from deepseek_harness import selection
+
+    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    wrong = _block("calc.py", "    return a - b", "    return a * b")
+    right = _block("calc.py", "    return a - b", "    return a + b")
+    also_wrong = _block("calc.py", "    return a - b", "    return a - b - 1")
+
+    responses = [wrong, right, also_wrong]
+    result = selection.select(
+        tmp_path, lambda i: responses[i],
+        # 2+2 cannot separate + from *; the oracle has to discriminate.
+        'python3 -c "import calc; assert calc.add(2,3)==5"', n=3,
+    )
+    try:
+        assert result.any_passed
+        assert result.winner.index == 1, result.render()
+        assert selection.adopt(result.winner, tmp_path) == ["calc.py"]
+        assert "return a + b" in (tmp_path / "calc.py").read_text()
+    finally:
+        selection.cleanup(result)
+
+
+def test_a_weak_verification_command_admits_a_wrong_patch(tmp_path):
+    """Pins the ceiling: selection rejects only what the test actually catches."""
+    from deepseek_harness import selection
+
+    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    multiply = _block("calc.py", "    return a - b", "    return a * b")
+
+    result = selection.select(
+        tmp_path, lambda i: multiply,
+        'python3 -c "import calc; assert calc.add(2,2)==4"', n=1,
+    )
+    try:
+        # Wrong code, passing suite. The gain is bounded by the oracle.
+        assert result.winner.passed
+    finally:
+        selection.cleanup(result)
+
+
+def test_candidates_are_isolated_from_the_real_workspace(tmp_path):
+    from deepseek_harness import selection
+
+    (tmp_path / "m.py").write_text("V = 1\n")
+    result = selection.select(
+        tmp_path, lambda i: _block("m.py", "V = 1", f"V = {i + 10}"),
+        "python3 -c \"import m; assert m.V == 11\"", n=3,
+    )
+    try:
+        # Nothing is written back until adopt() is called explicitly.
+        assert (tmp_path / "m.py").read_text() == "V = 1\n"
+        assert result.winner.index == 1
+    finally:
+        selection.cleanup(result)
+
+
+def test_selection_survives_a_candidate_that_raises(tmp_path):
+    from deepseek_harness import selection
+
+    (tmp_path / "m.py").write_text("V = 1\n")
+
+    def generate(i):
+        if i == 0:
+            raise RuntimeError("model call blew up")
+        return _block("m.py", "V = 1", "V = 2")
+
+    result = selection.select(
+        tmp_path, generate, 'python3 -c "import m; assert m.V == 2"', n=2)
+    try:
+        assert result.candidates[0].error.startswith("RuntimeError")
+        assert result.winner.index == 1 and result.winner.passed
+    finally:
+        selection.cleanup(result)
+
+
+def test_when_none_pass_the_smallest_applied_patch_wins(tmp_path):
+    from deepseek_harness import selection
+
+    (tmp_path / "m.py").write_text("V = 1\nW = 2\n")
+    big = (_block("m.py", "V = 1", "V = 99  # a much longer replacement line here")
+           + "\n\n" + _block("m.py", "W = 2", "W = 98  # and another long one"))
+    small = _block("m.py", "V = 1", "V = 3")
+
+    result = selection.select(
+        tmp_path, lambda i: [big, small][i], 'python3 -c "assert False"', n=2)
+    try:
+        assert not result.any_passed
+        assert result.winner.index == 1, result.render()
+    finally:
+        selection.cleanup(result)
+
+
+def test_workspace_size_guard(tmp_path):
+    from deepseek_harness import selection
+
+    (tmp_path / "m.py").write_text("V = 1\n" + "# padding\n" * 500)
+    result = selection.select(
+        tmp_path, lambda i: _block("m.py", "V = 1", "V = 2"),
+        None, n=1, max_workspace_bytes=100,
+    )
+    try:
+        assert "exceeds 100 bytes" in result.candidates[0].error
+        assert result.winner is None
+    finally:
+        selection.cleanup(result)
+
+
+def test_cleanup_removes_every_workspace(tmp_path):
+    from deepseek_harness import selection
+
+    (tmp_path / "m.py").write_text("V = 1\n")
+    result = selection.select(tmp_path, lambda i: _block("m.py", "V = 1", "V = 2"),
+                              None, n=2)
+    workspaces = [c.workspace for c in result.candidates if c.workspace]
+    assert workspaces and all(w.exists() for w in workspaces)
+    selection.cleanup(result)
+    assert not any(w.exists() for w in workspaces)
+    selection.cleanup(result)  # idempotent
+
+
+# --------------------------------------------------------------------------
+# Repo map
+# --------------------------------------------------------------------------
+
+def test_repomap_extracts_python_signatures(tmp_path):
+    from deepseek_harness import repomap
+
+    (tmp_path / "svc.py").write_text(
+        "TIMEOUT = 30\n\n"
+        "class Uploader:\n"
+        "    def upload(self, path: str, retries: int = 3) -> bool:\n"
+        "        return True\n\n"
+        "async def fetch(url: str) -> dict:\n"
+        "    return {}\n"
+    )
+    rendered = repomap.build(tmp_path, "upload retries").render()
+    assert "class Uploader" in rendered
+    assert "def upload(self, path: str, retries: int = 3) -> bool" in rendered
+    assert "async def fetch(url: str) -> dict" in rendered
+    assert "TIMEOUT" in rendered
+
+
+def test_repomap_ranks_task_relevant_files_first(tmp_path):
+    from deepseek_harness import repomap
+
+    (tmp_path / "uploader.py").write_text("def upload_chunk(data):\n    pass\n")
+    (tmp_path / "unrelated.py").write_text("def render_template(name):\n    pass\n")
+    ranked = repomap.build(tmp_path, "fix upload_chunk retry handling").top_paths(2)
+    assert ranked[0] == "uploader.py"
+
+
+def test_repomap_ranks_central_modules_above_leaves(tmp_path):
+    from deepseek_harness import repomap
+
+    (tmp_path / "core.py").write_text("def shared_helper():\n    pass\n")
+    for i in range(4):
+        (tmp_path / f"leaf{i}.py").write_text(
+            f"from core import shared_helper\n\ndef leaf_{i}():\n    shared_helper()\n")
+    # The task names nothing, so only centrality can order these.
+    ranked = repomap.build(tmp_path, "general cleanup").top_paths(1)
+    assert ranked[0] == "core.py"
+
+
+def test_repomap_respects_its_character_budget(tmp_path):
+    from deepseek_harness import repomap
+
+    for i in range(30):
+        (tmp_path / f"m{i}.py").write_text(
+            "".join(f"def fn_{i}_{j}(a, b, c):\n    pass\n" for j in range(20)))
+    rendered = repomap.build(tmp_path, "x").render(max_chars=2_000)
+    assert len(rendered) <= 2_200
+    assert "not shown" in rendered
+
+
+def test_repomap_handles_unparseable_and_binary_gracefully(tmp_path):
+    from deepseek_harness import repomap
+
+    (tmp_path / "broken.py").write_text("def f(:\n  syntax error\n")
+    (tmp_path / "ok.py").write_text("def good():\n    pass\n")
+    (tmp_path / "blob.bin").write_bytes(b"\x00\x01\x02")
+    assert "def good" in repomap.build(tmp_path, "x").render()

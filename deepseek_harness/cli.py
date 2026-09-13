@@ -23,6 +23,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--effort", default="high", choices=["low", "medium", "high", "max"])
     p.add_argument("--samples", type=int, default=1,
                    help="reasoning lane: best-of-N with a judge (cost scales linearly)")
+    p.add_argument("--candidates", type=int, default=1,
+                   help="coding lane: generate N patches and let --verify pick the "
+                        "winner (requires --verify; cost scales linearly)")
     p.add_argument("--no-review", action="store_true", help="coding lane: skip self-review")
     p.add_argument("--planner", help="override the planner model id")
     p.add_argument("--worker", help="override the worker model id")
@@ -62,7 +65,8 @@ def main(argv: list[str] | None = None) -> int:
         with Harness(config, root=args.root, verify_command=args.verify,
                      purpose_context=args.purpose) as h:
             outcome = h.run(task, lane=args.lane, effort=args.effort,
-                            samples=args.samples, review=not args.no_review)
+                            samples=args.samples, candidates=args.candidates,
+                            review=not args.no_review)
             if args.json:
                 import json
                 print(json.dumps({
