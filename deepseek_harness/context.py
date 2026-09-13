@@ -138,6 +138,27 @@ class Conversation:
         ).strip()
         self.transcript = tail
         self.compactions += 1
+        self._fold_digest(client)
+
+    def _fold_digest(self, client: DeepSeekClient) -> None:
+        """Keep the digest itself bounded.
+
+        Appending each summary to the last makes the digest grow without limit,
+        and it is re-sent on *every* request -- so the one part of the context
+        that exists to bound growth becomes the part that grows forever. Past a
+        threshold, fold the accumulated digests into a single one.
+        """
+        cap = self.config.max_digest_chars
+        if len(self.digest) <= cap:
+            return
+        folded = client.complete(
+            [M.user(COMPACT_PROMPT.format(body=self.digest[-180_000:]))],
+            model=self.config.utility_model,
+            thinking=Thinking.OFF,
+            label="compact:digest",
+        ).text.strip()
+        # Only accept the fold if it actually shrank; otherwise keep the tail.
+        self.digest = folded if 0 < len(folded) < len(self.digest) else self.digest[-cap:]
 
     @staticmethod
     def _flatten(m: M.Msg) -> str:

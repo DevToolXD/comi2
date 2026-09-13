@@ -141,6 +141,7 @@ class Config:
     # Context management
     compact_at_fraction: float = 0.60   # of the model context window
     keep_live_turns: int = 6            # turns kept with verbatim reasoning_content
+    max_digest_chars: int = 24_000      # cap on the accumulated digest
     max_working_memory_chars: int = 12_000
 
     # Refusal handling

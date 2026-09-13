@@ -15,6 +15,7 @@ Consequences this module encodes:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Literal
 
@@ -133,17 +134,36 @@ def render(messages: Iterable[Msg], *, thinking: bool) -> list[dict]:
     return out
 
 
+# Hangul, kana and CJK ideographs tokenise far denser than latin text: roughly
+# one token per character against ~3.5 for prose and code. A single blended
+# constant underestimates a Korean transcript by 2-3x, which would let the
+# context overflow before compaction ever fires.
+_DENSE = re.compile(r"[\u1100-\u11FF\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF"
+                    r"\uA960-\uA97F\uAC00-\uD7FF\uF900-\uFAFF\uFF00-\uFFEF]")
+
+_DENSE_CHARS_PER_TOKEN = 1.0
+_SPARSE_CHARS_PER_TOKEN = 3.5
+
+
 def approx_tokens(messages: Iterable[Msg]) -> int:
     """Cheap upper-ish bound on prompt size.
 
     Deliberately not a real tokeniser: this only has to decide *when* to
-    compact, and every real count comes back from the API afterwards.  ~3.2
-    chars/token is a safe blend of English, Korean and code.
+    compact, and every real count comes back from the API afterwards. It is
+    script-aware because the error from treating Korean like English is not
+    cosmetic -- it is the difference between compacting and overflowing.
+
+    Unverified against DeepSeek's actual tokeniser; the constants are chosen to
+    over-count rather than under-count.
     """
-    chars = 0
+    total = 0.0
     for m in messages:
-        chars += len(m.content or "") + len(m.reasoning_content or "")
+        text = (m.content or "") + (m.reasoning_content or "")
         for tc in m.tool_calls:
-            chars += len(tc.arguments) + len(tc.name) + 16
-        chars += 8
-    return int(chars / 3.2) + 1
+            text += tc.arguments + tc.name
+            total += 16
+        dense = len(_DENSE.findall(text))
+        total += dense / _DENSE_CHARS_PER_TOKEN
+        total += (len(text) - dense) / _SPARSE_CHARS_PER_TOKEN
+        total += 8
+    return int(total) + 1

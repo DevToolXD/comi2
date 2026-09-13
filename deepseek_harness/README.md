@@ -97,6 +97,12 @@ Edits use anchored SEARCH/REPLACE (`patch.py`) because a mismatch is
 first hit, and a block matching nowhere comes back with the closest lines that
 actually exist so the model can correct it.
 
+That is a reliability argument, **not an accuracy one**. Published comparisons
+put edit formats within a few points of each other for strong models, and one
+study measured search/replace 1.3 points *below* whole-file for DeepSeek-V3.
+With V4's 384K output cap, whole-file rewriting is also far more viable than it
+was. Treat the format as a tunable to A/B on your own tasks, not a settled win.
+
 ## Refusal handling
 
 Configurable via `refusal_max_attempts` (default 3). Detection is multilingual
@@ -160,9 +166,29 @@ calls=11  in=284,102 (cache 71%)  out=18,340  think=42,110  $0.2214  96.3s
 ## Tests
 
 ```bash
-python -m pytest tests/ -q     # 56 tests, no network, no API key
+python -m pytest tests/ -q     # 69 tests, no network, no API key
 ```
 
-Unit coverage for the round-trip rule, cache ordering, the patch engine,
-refusal classification, pricing and budgets; end-to-end wiring for both agents
-and the tool loop against a mocked transport.
+Unit coverage for the round-trip rule, cache ordering, compaction, the patch
+engine, refusal classification, pricing and budgets; end-to-end wiring for both
+agents and the tool loop against a mocked transport.
+
+## Known gaps
+
+Be aware of these before trusting it in production:
+
+- **It has never run against the live API.** Every wire-level assumption --
+  parameter names, the exact 400 for a missing round-trip, usage field names,
+  model IDs -- comes from documentation summaries, not from a real call. First
+  contact may need fixes.
+- **No streaming.** `stream` is always false, so a long generation gives no
+  progress and cannot be cancelled early. Truncation is handled by resuming
+  (`auto_continue`) rather than by streaming.
+- **The token estimator is unvalidated** against DeepSeek's tokeniser. It is
+  script-aware and tuned to over-count, but the compaction threshold rests on it.
+- **The cache-ordering claim is unmeasured.** The layout follows from how prefix
+  caches work; nobody has yet watched `cache_hit_rate` on a real run to confirm
+  the win.
+- **`run_command` is `shell=True` with no allowlist or sandbox.** Paths are
+  confined to the workspace root; commands are not. Run it where you would run
+  an untrusted script.

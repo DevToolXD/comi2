@@ -32,6 +32,14 @@ class Thinking:
 Thinking.OFF = Thinking(enabled=False, effort=None)
 
 
+CONTINUE_PROMPT = (
+    "Your previous message was cut off by the output limit. Continue from the "
+    "exact character where it stopped. Do not repeat anything already sent, do "
+    "not restate the task, and do not add a preamble -- resume mid-token if that "
+    "is where it ended."
+)
+
+
 @dataclass
 class Completion:
     message: M.Msg
@@ -40,6 +48,11 @@ class Completion:
     finish_reason: str = ""
     latency: float = 0.0
     raw: dict = field(default_factory=dict)
+
+    @property
+    def truncated(self) -> bool:
+        """True when the server stopped on the output cap, not on a real stop."""
+        return self.finish_reason == "length"
 
     @property
     def text(self) -> str:
@@ -75,7 +88,7 @@ class DeepSeekClient:
         self._resolved_model: dict[str, str] = {}
 
     # -- public ----------------------------------------------------------
-    def complete(
+    def _single(
         self,
         history: Sequence[M.Msg],
         *,
@@ -131,6 +144,44 @@ class DeepSeekClient:
             latency=latency,
             raw=raw,
         )
+
+    def complete(self, history: Sequence[M.Msg], *, auto_continue: int = 2,
+                 **kw) -> Completion:
+        """Call the model, transparently resuming a response cut off by the output cap.
+
+        ``finish_reason == "length"`` means the server stopped mid-sentence. Left
+        unhandled it is indistinguishable from a finished answer, so a truncated
+        SEARCH/REPLACE block or half a proof flows downstream as if complete --
+        the patch then fails to parse and the agent burns a repair round on a
+        problem that was never in the edit.
+        """
+        completion = self._single(history, **kw)
+        if not completion.truncated or auto_continue <= 0:
+            return completion
+
+        base_label = kw.pop("label", "")
+        parts = [completion.text]
+        usage, latency = completion.usage, completion.latency
+        hist = list(history)
+
+        for round_ in range(auto_continue):
+            hist = hist + [completion.message, M.user(CONTINUE_PROMPT)]
+            completion = self._single(hist, label=f"{base_label}+cont{round_ + 1}", **kw)
+            parts.append(completion.text)
+            usage, latency = usage + completion.usage, latency + completion.latency
+            if not completion.truncated:
+                break
+
+        # The merged turn carries the final segment's chain of thought. The API
+        # requires the field to be present and does not check that it matches the
+        # whole body, so replay stays valid.
+        merged = M.Msg(
+            "assistant", "".join(parts),
+            reasoning_content=completion.message.reasoning_content,
+            tool_calls=completion.message.tool_calls,
+        )
+        return Completion(merged, usage, completion.model, completion.finish_reason,
+                          latency, completion.raw)
 
     def ask(self, prompt: str, *, system: str | None = None, **kw) -> str:
         """One-shot convenience call; returns text only."""

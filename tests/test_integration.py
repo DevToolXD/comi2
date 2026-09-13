@@ -417,3 +417,142 @@ def test_thinking_has_no_phantom_constructor_field():
     import dataclasses
     assert [f.name for f in dataclasses.fields(Thinking)] == ["enabled", "effort"]
     assert Thinking.OFF.enabled is False
+
+
+# --------------------------------------------------------------------------
+# Compaction -- the load-bearing feature that previously had no coverage
+# --------------------------------------------------------------------------
+
+def _fill(convo, n, prefix="t"):
+    for i in range(n):
+        convo.add_user(f"{prefix} user {i}")
+        convo.add(M.assistant(f"{prefix} assistant {i}", reasoning=f"cot {i}"))
+
+
+def test_compaction_folds_the_head_and_keeps_the_live_tail():
+    from deepseek_harness.context import Conversation
+
+    convo = Conversation(Config(keep_live_turns=4), system_prompt="sys")
+    client = make_client(by_label={"compact": {"content": "DIGEST"}})
+    _fill(convo, 12)
+    assert len(convo.transcript) == 24
+
+    convo.compact(client)
+    assert len(convo.transcript) == 4
+    assert convo.digest == "DIGEST"
+    # The surviving tail keeps its verbatim chain of thought.
+    assert all(m.reasoning_content for m in convo.transcript if m.role == "assistant")
+
+
+def test_compacted_digest_is_rendered_as_user_role_not_assistant():
+    """A digest has no reasoning_content, so it must never occupy an assistant turn."""
+    from deepseek_harness.context import Conversation
+
+    convo = Conversation(Config(keep_live_turns=2), system_prompt="sys")
+    client = make_client(by_label={"compact": {"content": "DIGEST"}})
+    _fill(convo, 8)
+    convo.compact(client)
+
+    rendered = M.render(convo.render(), thinking=True)
+    digest_turns = [m for m in rendered if "prior_context_digest" in (m.get("content") or "")]
+    assert len(digest_turns) == 1
+    assert digest_turns[0]["role"] == "user"
+    for m in rendered:
+        if m["role"] == "assistant":
+            assert m.get("reasoning_content")
+
+
+def test_compaction_never_orphans_a_tool_result():
+    from deepseek_harness.context import Conversation
+
+    convo = Conversation(Config(keep_live_turns=2), system_prompt="s")
+    client = make_client(by_label={"compact": {"content": "D"}})
+    call = M.ToolCall("id1", "read_file", '{"path": "a"}')
+    for i in range(6):
+        convo.add_user(f"u{i}")
+        convo.add(M.Msg("assistant", None, reasoning_content="r", tool_calls=[call]))
+        convo.add(M.tool_result("id1", f"result {i}"))
+
+    convo.compact(client)
+    assert convo.transcript[0].role != "tool", "a tool result was split from its call"
+
+
+def test_digest_stays_bounded_across_many_compactions():
+    """Regression: the digest is re-sent every request, so it cannot grow forever."""
+    from deepseek_harness.context import Conversation
+
+    cap = 2_000
+    convo = Conversation(Config(keep_live_turns=2, max_digest_chars=cap), system_prompt="s")
+    chunk = "SUMMARY " * 120  # ~960 chars per compaction
+    client = make_client(by_label={
+        "compact:digest": {"content": "FOLDED"},
+        "compact": {"content": chunk},
+    })
+    for n in range(10):
+        _fill(convo, 6, prefix=f"r{n}")
+        convo.compact(client)
+
+    assert len(convo.digest) <= cap, f"digest grew to {len(convo.digest)} chars"
+
+
+def test_should_compact_fires_on_a_full_context():
+    from deepseek_harness.context import Conversation
+
+    convo = Conversation(Config(compact_at_fraction=0.5), system_prompt="s")
+    assert not convo.should_compact("deepseek-flash")
+    convo.add_user("x" * 4_000_000)   # well past half of a 1M-token window
+    assert convo.should_compact("deepseek-flash")
+
+
+def test_korean_is_not_counted_as_cheaply_as_english():
+    """A blended chars/token constant underestimates Hangul by 2-3x."""
+    korean = M.approx_tokens([M.user("한" * 1000)])
+    english = M.approx_tokens([M.user("a" * 1000)])
+    assert korean > english * 2
+
+
+# --------------------------------------------------------------------------
+# Truncated responses
+# --------------------------------------------------------------------------
+
+def test_truncated_response_is_resumed_and_stitched():
+    parts = iter([
+        {"content": "def f():\n    ret", "finish": "length"},
+        {"content": "urn 1\n", "finish": "stop"},
+    ])
+    client = make_client(by_label={"": lambda: next(parts)})
+    out = client.complete([M.user("write f")], thinking=Thinking.OFF)
+
+    assert out.text == "def f():\n    return 1\n"
+    assert not out.truncated
+    # Usage is summed across both segments, not just the last.
+    assert out.usage.completion_tokens == 80
+
+
+def test_continuation_is_bounded():
+    client = make_client()
+    client.transport.default = {"content": "chunk ", "finish": "length"}
+    out = client.complete([M.user("q")], thinking=Thinking.OFF, auto_continue=2)
+
+    assert out.truncated                      # still truncated, but we stopped
+    assert len(client.transport.labels) == 3  # initial + exactly 2 continuations
+
+
+def test_auto_continue_can_be_disabled():
+    client = make_client()
+    client.transport.default = {"content": "partial", "finish": "length"}
+    out = client.complete([M.user("q")], thinking=Thinking.OFF, auto_continue=0)
+    assert out.truncated and len(client.transport.labels) == 1
+
+
+def test_continuation_replays_the_partial_turn_with_its_reasoning():
+    parts = iter([
+        {"content": "half", "reasoning": "my cot", "finish": "length"},
+        {"content": " done", "finish": "stop"},
+    ])
+    client = make_client(by_label={"": lambda: next(parts)})
+    client.complete([M.user("q")], thinking=Thinking(True, "high"))
+
+    second = client.transport.payloads[1]["messages"]
+    assistant_turns = [m for m in second if m["role"] == "assistant"]
+    assert assistant_turns[0]["reasoning_content"] == "my cot"
