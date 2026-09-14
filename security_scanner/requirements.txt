@@ -1,0 +1,4 @@
+# Only one runtime dependency. If it's missing the scanner still runs via a
+# built-in urllib fallback, but requests gives connection pooling, retries and
+# better cookie/redirect handling.
+requests>=2.25.0

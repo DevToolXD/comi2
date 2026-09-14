@@ -1,0 +1,15 @@
+# Scan output
+scan_reports/
+*.log
+*.json.report
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# local test artifacts
+server.pid
+server.log
